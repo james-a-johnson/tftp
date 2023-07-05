@@ -52,20 +52,17 @@ enum Message {
     },
 }
 
-impl From<Box<(dyn std::error::Error + 'static)>> for Message {
-    fn from(value: Box<(dyn std::error::Error + 'static)>) -> Self {
-        Message::Error {
-            kind: Error::Undefined,
-            msg: format!("{:?}", value),
-        }
+impl From<crate::error::Error> for Message {
+    fn from(value: crate::error::Error) -> Self {
+        Message::Error { kind: value, msg: format!("{:?}", value) }
     }
 }
 
 impl From<NulError> for Message {
-    fn from(value: NulError) -> Self {
+    fn from(_value: NulError) -> Self {
         Message::Error {
             kind: Error::Undefined,
-            msg: "Invalid string received".into(),
+            msg: "Received invalid string".into(),
         }
     }
 }
