@@ -1,8 +1,11 @@
 use std::env::current_dir;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::net::UdpSocket;
+use std::os::unix::prelude::FileExt;
 use std::path::PathBuf;
 use std::thread::spawn;
+use std::fs::OpenOptions;
+use std::time::Duration;
 
 mod error;
 mod message;
@@ -25,6 +28,7 @@ pub struct ServerBuilder {
     address: Option<IpAddr>,
     port: Option<u16>,
     serve_dir: Option<PathBuf>,
+    timeout: Option<Duration>,
 }
 
 impl ServerBuilder {
@@ -33,6 +37,7 @@ impl ServerBuilder {
             address: None,
             port: None,
             serve_dir: None,
+            timeout: None,
         }
     }
 
@@ -41,6 +46,7 @@ impl ServerBuilder {
             address: Some(addr),
             port: self.port,
             serve_dir: self.serve_dir,
+            timeout: self.timeout,
         }
     }
 
@@ -49,6 +55,7 @@ impl ServerBuilder {
             address: self.address,
             port: Some(port),
             serve_dir: self.serve_dir,
+            timeout: self.timeout,
         }
     }
 
@@ -57,6 +64,16 @@ impl ServerBuilder {
             address: self.address,
             port: self.port,
             serve_dir: Some(path),
+            timeout: self.timeout,
+        }
+    }
+
+    pub fn timeout(self, time: Duration) -> Self {
+        Self {
+            address: self.address,
+            port: self.port,
+            serve_dir: self.serve_dir,
+            timeout: Some(time),
         }
     }
 
@@ -72,6 +89,9 @@ impl ServerBuilder {
             self.address.unwrap_or(Ipv4Addr::UNSPECIFIED.into()),
             self.port.unwrap_or(TFTP_SERVE_PORT),
         ))?;
+        let timeout = self.timeout.unwrap_or(Duration::new(10, 0));
+        socket.set_read_timeout(Some(timeout))?;
+        socket.set_write_timeout(Some(timeout))?;
         Ok(Server {
             socket,
             directory: dir,
@@ -151,6 +171,11 @@ fn handle_connection(host_addr: IpAddr, addr: SocketAddr, data: Vec<u8>, base_pa
                         send!(conn_sock, &access.to_vec());
                     } else {
                         let exists = filepath.try_exists().unwrap_or(false);
+                        if filepath.is_dir() {
+                            let directory = Message::Error { kind: Error::AccessViolation, msg: "Can't read or write a directory".into() };
+                            send!(conn_sock, &directory.to_vec());
+                            return;
+                        }
                         match (read, exists) {
                             (true, true) => handle_read_request(conn_sock, filepath),
                             (false, _) => handle_write_request(conn_sock, filepath),
@@ -174,6 +199,48 @@ fn handle_connection(host_addr: IpAddr, addr: SocketAddr, data: Vec<u8>, base_pa
     }
 }
 
-fn handle_read_request(conn: UdpSocket, filename: PathBuf) {}
+fn handle_read_request(conn: UdpSocket, filename: PathBuf) {
+    let mut read_buffer = [0u8; TFTP_BLOCK_SIZE];
+    let mut block: u16 = 0;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(false)
+        .create(false)
+        .open(filename.clone());
+    let file = match file {
+        Ok(f) => f,
+        Err(_) => {
+            let open = Message::Error { kind: Error::AccessViolation, msg: "Couldn't open file".into() };
+            send!(conn, &open.to_vec());
+            eprintln!("ERROR: Failed to open file {}", filename.display());
+            return;
+        }
+    };
+    'read_loop: loop {
+        let file_read = file.read_at(&mut read_buffer, (TFTP_BLOCK_SIZE * (block as usize)) as u64);
+        match file_read {
+            Ok(r) => {
+                let data = Message::Data { block, data: read_buffer[..r].to_vec() };
+                let send = conn.send(&data.to_vec());
+                match send {
+                    Ok(_) => {},
+                    Err(e) => {
+                        match e.kind() {
+                            std::io::ErrorKind::Interrupted => continue 'read_loop,
+                            _ => {
+                                // I don't think any other error is recoverable so just return
+                                eprintln!("ERROR: Connection failed with {}", e);
+                                return;
+                            }
+                        }
+                    },
+                }
+            },
+            Err(e) => {
+                
+            }
+        }
+    }
+}
 
 fn handle_write_request(conn: UdpSocket, filename: PathBuf) {}
