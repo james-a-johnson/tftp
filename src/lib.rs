@@ -1,6 +1,6 @@
 use std::env::current_dir;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::net::{ToSocketAddrs, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::UdpSocket;
 use std::path::PathBuf;
 use std::thread::spawn;
 
@@ -8,6 +8,7 @@ mod error;
 mod message;
 
 pub use error::Error;
+use message::Message;
 
 const TFTP_SERVE_PORT: u16 = 69;
 const TFTP_BLOCK_SIZE: usize = 512;
@@ -78,12 +79,14 @@ pub struct Server {
 impl Server {
     pub fn listen(self) -> ! {
         let mut conn_buffer = [0u8; 1024];
+        let local_addr = self.socket.local_addr().expect("Couldn't get bound address").ip();
         loop {
             match self.socket.recv_from(&mut conn_buffer) {
                 Ok((s, addr)) => {
                     let message = &conn_buffer[..s];
+                    let dir = self.directory.clone();
                     spawn(move || {
-                        handle_connection(addr, message.to_vec());
+                        handle_connection(local_addr.clone(), addr, message.to_vec(), dir);
                     });
                 }
                 Err(e) => {
@@ -105,7 +108,7 @@ impl std::fmt::Debug for Server {
     }
 }
 
-fn handle_connection(host_addr: IpAddr, addr: SocketAddr, data: Vec<u8>) {
+fn handle_connection(host_addr: IpAddr, addr: SocketAddr, data: Vec<u8>, base_path: PathBuf) {
     eprintln!("INFO: Got a connection from {addr:?}");
     // First get a udp socket to use. This will be used for sending back an error or for the rest of
     // the connection if everything goes well
@@ -121,39 +124,7 @@ fn handle_connection(host_addr: IpAddr, addr: SocketAddr, data: Vec<u8>) {
         eprintln!("ERROR: Failed to connect to {addr:?}");
         return;
     }
-    if data.len() < 4 {
-        eprintln!("ERROR: Received message with less than 4 bytes");
-        let error_response = ErrorMsg {
-            kind: Error::Undefined,
-            msg: "Request must be at least 4 bytes",
-        };
-        conn_sock.send(&error_response.to_bytes());
-        return;
-    }
-    let op = u16::from_be_bytes(data[..2].try_into().unwrap());
-    let op = Operation::try_from(op);
-    let op = match op {
-        Ok(o) => o,
-        Err(_) => {
-            let error_response = ErrorMsg {
-                kind: Error::Undefined,
-                msg: "Undefined operation",
-            };
-            conn_sock.send(&error_response.to_bytes());
-            return;
-        }
-    };
-    match op {
-        Operation::Rrq => handle_read_request(conn_sock, &data[2..]),
-        Operation::Wrq => handle_write_request(conn_sock, &data[2..]),
-        _ => {
-            let error_response = ErrorMsg {
-                kind: Error::Illegal,
-                msg: "Invalid initial operation",
-            };
-            conn_sock.send(&error_response.to_bytes());
-        }
-    }
+    let request = Message::try_from_bytes(&data);
 }
 
 fn handle_read_request(conn: UdpSocket, req: &[u8]) {}
