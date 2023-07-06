@@ -29,10 +29,20 @@ impl std::convert::TryFrom<u16> for Operation {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Mode {
+pub(crate) enum Mode {
     Octet,
     NetAscii,
     Mail,
+}
+
+impl Mode {
+    pub(crate) fn to_str(&self) -> &'static [u8] {
+        match *self {
+            Mode::Octet => b"Octet\x00",
+            Mode::NetAscii => b"NetAscii\x00",
+            Mode::Mail => b"Mail\x00",
+        }
+    }
 }
 
 impl TryFrom<&str> for Mode {
@@ -117,6 +127,45 @@ impl Message {
             Operation::Error => Message::parse_error(&data[2..]),
             Operation::Rrq => Message::parse_req(true, &data[2..]),
             Operation::Wrq => Message::parse_req(false, &data[2..]),
+        }
+    }
+
+    pub(crate)fn to_vec(&self) -> Vec<u8> {
+        match self {
+            Message::Ack { block } => {
+                let mut data = Vec::with_capacity(4);
+                data.extend((Operation::Ack as u16).to_be_bytes());
+                data.extend(block.to_be_bytes());
+                data
+            },
+            Message::Data { block, data } => {
+                let mut bytes = Vec::with_capacity(data.len() + 4);
+                bytes.extend((Operation::Data as u16).to_be_bytes());
+                bytes.extend(block.to_be_bytes());
+                bytes.extend(data);
+                bytes
+            },
+            Message::Error { kind, msg } => {
+                let mut bytes = Vec::with_capacity(4 + msg.len());
+                bytes.extend((Operation::Error as u16).to_be_bytes());
+                bytes.extend((*kind as u16).to_be_bytes());
+                bytes.extend(msg.as_bytes());
+                bytes.push(0);
+                bytes
+            },
+            Message::Request { read, filename, mode } => {
+                // Make sure the bytes have enough capacity for any message size
+                let mut bytes = Vec::with_capacity(512);
+                if *read {
+                    bytes.extend((Operation::Rrq as u16).to_be_bytes());
+                } else {
+                    bytes.extend((Operation::Wrq as u16).to_be_bytes());
+                }
+                bytes.extend(filename.to_str().expect("Path is invalid UTF8 string").as_bytes());
+                bytes.push(0);
+                bytes.extend(mode.to_str());
+                bytes
+            }
         }
     }
 
