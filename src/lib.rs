@@ -15,6 +15,7 @@ use message::{Mode, Message};
 
 const TFTP_SERVE_PORT: u16 = 69;
 const TFTP_BLOCK_SIZE: usize = 512;
+const NUM_RETIRES: usize = 3;
 
 macro_rules! send {
     ($socket:ident, $data:expr) => {
@@ -118,9 +119,14 @@ impl Server {
                     });
                 }
                 Err(e) => {
-                    eprintln!("ERROR: Trying to read from new connection");
-                    eprintln!("ERROR: {e:?}");
-                    continue;
+                    match e.kind() {
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => continue,
+                        _ => {
+                            eprintln!("ERROR: Trying to read from new connection");
+                            eprintln!("ERROR: {e:?}");
+                            continue;        
+                        }
+                    }
                 }
             }
         }
@@ -201,7 +207,10 @@ fn handle_connection(host_addr: IpAddr, addr: SocketAddr, data: Vec<u8>, base_pa
 
 fn handle_read_request(conn: UdpSocket, filename: PathBuf) {
     let mut read_buffer = [0u8; TFTP_BLOCK_SIZE];
-    let mut block: u16 = 0;
+    let mut receive_buffer = [0u8; 2 * TFTP_BLOCK_SIZE];
+    let mut block: u16 = 1;
+    let mut last = false;
+    let mut ack_attempts = 0;
     let file = OpenOptions::new()
         .read(true)
         .write(false)
@@ -217,16 +226,28 @@ fn handle_read_request(conn: UdpSocket, filename: PathBuf) {
         }
     };
     'read_loop: loop {
-        let file_read = file.read_at(&mut read_buffer, (TFTP_BLOCK_SIZE * (block as usize)) as u64);
+        let file_read = file.read_at(&mut read_buffer, (TFTP_BLOCK_SIZE * ((block - 1) as usize)) as u64);
         match file_read {
             Ok(r) => {
                 let data = Message::Data { block, data: read_buffer[..r].to_vec() };
-                let send = conn.send(&data.to_vec());
+                let msg = data.to_vec();
+                let send = conn.send(&msg);
+                if r < TFTP_BLOCK_SIZE {
+                    last = true;
+                }
                 match send {
-                    Ok(_) => {},
+                    Ok(s) => {
+                        if s != msg.len() {
+                            // Unable to send all of the message
+                            // Assume connection is bad and exit
+                            eprintln!("ERROR: Failed to send whole message");
+                            break 'read_loop;
+                        }
+                    },
                     Err(e) => {
                         match e.kind() {
                             std::io::ErrorKind::Interrupted => continue 'read_loop,
+                            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => continue 'read_loop,
                             _ => {
                                 // I don't think any other error is recoverable so just return
                                 eprintln!("ERROR: Connection failed with {}", e);
@@ -237,8 +258,65 @@ fn handle_read_request(conn: UdpSocket, filename: PathBuf) {
                 }
             },
             Err(e) => {
-                
+                eprintln!("ERROR: Failed to read file with {:?}", e);
+                let data = Message::Error { kind: Error::Undefined, msg: "Failed to read file".into() };
+                send!(conn, &data.to_vec());
+                break 'read_loop;
             }
+        }
+
+        ack_attempts += 1;
+        if ack_attempts > NUM_RETIRES {
+            eprintln!("ERROR: Connection dropped");
+            break 'read_loop;
+        }
+        match conn.recv(&mut receive_buffer) {
+            Ok(s) => {
+                match Message::try_from_bytes(&receive_buffer[..s]) {
+                    Ok(m) => {
+                        match m {
+                            Message::Ack { block: b } => {
+                                if b == block {
+                                    block += 1;
+                                    ack_attempts = 0;
+                                    if last {
+                                        break 'read_loop;
+                                    }
+                                } else {
+                                    continue 'read_loop;
+                                }
+                            },
+                            m @ Message::Error { .. } => {
+                                eprintln!("ERROR: Received invalid message {:?}", m);
+                                break 'read_loop;
+                            },
+                            _ => {
+                                let invalid = Message::Error { kind: Error::Illegal, msg: "Illegal message type".into() };
+                                send!(conn, &invalid.to_vec());
+                                break 'read_loop;
+                            }
+                        }
+                    },
+                    Err(error_msg) => {
+                        eprintln!("ERROR: Failed to parse message from client {:?}", error_msg);
+                        send!(conn, &error_msg.to_vec());
+                        break 'read_loop;
+                    }
+                }
+            },
+            Err(io_err) => {
+                match io_err.kind() {
+                    std::io::ErrorKind::Interrupted => continue 'read_loop,
+                    std::io::ErrorKind::TimedOut => {
+                        ack_attempts += 1;
+                        continue 'read_loop;
+                    },
+                    _ => {
+                        eprintln!("ERROR: Connection dropped");
+                        break 'read_loop;
+                    },
+                }
+            },
         }
     }
 }
