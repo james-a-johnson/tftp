@@ -1,8 +1,10 @@
 use std::env::current_dir;
+use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::net::UdpSocket;
 use std::os::unix::prelude::FileExt;
 use std::path::PathBuf;
+use std::ptr::read;
 use std::thread::spawn;
 use std::fs::OpenOptions;
 use std::time::Duration;
@@ -206,6 +208,7 @@ fn handle_connection(host_addr: IpAddr, addr: SocketAddr, data: Vec<u8>, base_pa
 }
 
 fn handle_read_request(conn: UdpSocket, filename: PathBuf) {
+    eprintln!("INFO: Sending file {:?}", filename);
     let mut read_buffer = [0u8; TFTP_BLOCK_SIZE];
     let mut receive_buffer = [0u8; 2 * TFTP_BLOCK_SIZE];
     let mut block: u16 = 1;
@@ -321,4 +324,107 @@ fn handle_read_request(conn: UdpSocket, filename: PathBuf) {
     }
 }
 
-fn handle_write_request(conn: UdpSocket, filename: PathBuf) {}
+fn handle_write_request(conn: UdpSocket, filename: PathBuf) {
+    eprintln!("INFO: Receiving file {:?}", filename);
+    let mut receive_buffer = [0u8; 2 * TFTP_BLOCK_SIZE];
+    let mut block: u16 = 0;
+    let mut read_attempts = 0;
+    let file = OpenOptions::new()
+        .read(false)
+        .write(true)
+        .create_new(true)
+        .open(filename.clone());
+    let mut file = match file {
+        Ok(f) => f,
+        Err(_) => {
+            let open = Message::Error { kind: Error::AccessViolation, msg: "Couldn't open file".into() };
+            send!(conn, &open.to_vec());
+            eprintln!("ERROR: Failed to open file {}", filename.display());
+            return;
+        }
+    };
+    // Send initial ack
+    let initial_ack = Message::Ack { block };
+    match conn.send(&initial_ack.to_vec()) {
+        Ok(_) => block += 1,
+        Err(_) => {
+            drop(file);
+            if std::fs::remove_file(filename).is_err() {
+                eprintln!("ERROR: Failed to remove empty file");
+            }
+            return;
+        },
+    }
+    'write_loop: loop {
+        read_attempts += 1;
+        if read_attempts > NUM_RETIRES {
+            eprintln!("ERROR: Connection dropped");
+            break 'write_loop;
+        }
+        match conn.recv(&mut receive_buffer) {
+            Ok(s) => {
+                match Message::try_from_bytes(&receive_buffer[..s]) {
+                    Ok(m) => {
+                        match m {
+                            Message::Data { block: b, data: file_data } => {
+                                if b == block {
+                                    read_attempts = 0;
+                                    match file.write_all(&file_data) {
+                                        Ok(()) => {
+                                            let ack = Message::Ack { block };
+                                            match conn.send(&ack.to_vec()) {
+                                                Ok(_) => {
+                                                    block += 1;
+                                                    continue 'write_loop;
+                                                },
+                                                Err(_) => {
+                                                    eprintln!("ERROR: Connection dropped");
+                                                    break 'write_loop;
+                                                }
+                                            }
+                                        },
+                                        Err(e) => {
+                                            eprintln!("ERROR: Failed to write to file {:?}", e);
+                                            let err_resp = Message::Error { kind: Error::Undefined, msg: "Failed to write file".into() };
+                                            send!(conn, &err_resp.to_vec());
+                                            break 'write_loop;
+                                        }
+                                    }
+                                } else {
+                                    continue 'write_loop;
+                                }
+                            },
+                            m @ Message::Error { .. } => {
+                                eprintln!("ERROR: Received error message {:?}", m);
+                                break 'write_loop;
+                            },
+                            _ => {
+                                let invalid = Message::Error { kind: Error::Illegal, msg: "Illegal message type".into() };
+                                send!(conn, &invalid.to_vec());
+                                break 'write_loop;
+                            }
+                        }
+                    },
+                    Err(error_msg) => {
+                        eprintln!("ERROR: Failed to parse message from client {:?}", error_msg);
+                        send!(conn, &error_msg.to_vec());
+                        break 'write_loop;
+                    }
+                }
+            },
+            Err(io_err) => {
+                match io_err.kind() {
+                    std::io::ErrorKind::Interrupted => continue 'write_loop,
+                    std::io::ErrorKind::TimedOut => {
+                        read_attempts += 1;
+                        continue 'write_loop;
+                    },
+                    _ => {
+                        eprintln!("ERROR: Connection dropped");
+                        break 'write_loop;
+                    },
+                }
+            },
+        }
+    }
+}
