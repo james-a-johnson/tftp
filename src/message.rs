@@ -1,16 +1,28 @@
+//! Implementation of parsing and encoding of message types for TFTP
+//!
+//! There are really only two important types from this package:
+//! - [`Mode`]
+//! - [`Message`]
+
 use core::ffi::FromBytesUntilNulError;
-use std::ffi::{NulError, CStr};
+use std::ffi::{CStr, NulError};
 use std::path::PathBuf;
 
 use crate::error::Error;
 
+/// All of the valid TFTP operations
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u16)]
 enum Operation {
+    /// Read request
     Rrq = 1,
+    /// Write request
     Wrq = 2,
+    /// Data message
     Data = 3,
+    /// Acknowledgement
     Ack = 4,
+    /// Error message
     Error = 5,
 }
 
@@ -28,10 +40,14 @@ impl std::convert::TryFrom<u16> for Operation {
     }
 }
 
+/// All of the valid TFTP data modes
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Mode {
+    /// Octet mode
     Octet,
+    /// Net ascii mode
     NetAscii,
+    /// Mail mode
     Mail,
 }
 
@@ -53,34 +69,55 @@ impl TryFrom<&str> for Mode {
             "octet" => Ok(Self::Octet),
             "netascii" => Ok(Self::NetAscii),
             "mail" => Ok(Self::Mail),
-            _ => Err(Message::Error { kind: Error::Undefined, msg: "Undefined mode string".into() })
+            _ => Err(Message::Error {
+                kind: Error::Undefined,
+                msg: "Undefined mode string".into(),
+            }),
         }
     }
 }
 
+/// All of the valid TFTP message types
 #[derive(Debug)]
 pub(crate) enum Message {
+    /// Read or write request
     Request {
+        /// Indicates if the request is to read a file or write a file
+        ///
+        /// True indicates reading and false indicates writing.
         read: bool,
+        /// Path of the file to read or write
         filename: PathBuf,
+        /// Mode in which the data will be sent
         mode: Mode,
     },
+    /// Data message
     Data {
+        /// Block number of the data
         block: u16,
+        /// Data within data packet
         data: Vec<u8>,
     },
+    /// Data acknowledgement
     Ack {
+        /// Block number
         block: u16,
     },
+    /// Error message
     Error {
+        /// Type of error
         kind: Error,
+        /// Error message associated with error
         msg: String,
     },
 }
 
 impl From<crate::error::Error> for Message {
     fn from(value: crate::error::Error) -> Self {
-        Message::Error { kind: value, msg: format!("{:?}", value) }
+        Message::Error {
+            kind: value,
+            msg: format!("{:?}", value),
+        }
     }
 }
 
@@ -112,6 +149,16 @@ impl From<std::str::Utf8Error> for Message {
 }
 
 impl Message {
+    /// Try to parse a message out of binary data (e.g. data read from socket)
+    ///
+    /// # Errors
+    /// Many different errors can occur when trying to parse the packet. Any type of incorrect formatting will cause
+    /// an error.
+    /// 
+    /// # Return
+    /// This function returns a message whether or not it succeeds. In the [`core::result::Result::Ok`] case,
+    /// a message was properly parsed from the data. In the [`core::result::Result::Err`] case, parsing failed
+    /// and the method is returning a message that can be sent back to the client as an error message.
     pub(crate) fn try_from_bytes(data: &[u8]) -> Result<Self, Self> {
         if data.len() < 4 {
             return Err(Self::Error {
@@ -130,21 +177,22 @@ impl Message {
         }
     }
 
-    pub(crate)fn to_vec(&self) -> Vec<u8> {
+    /// Converts the message to a vector that can be then sent over the socket as a TFTP message
+    pub(crate) fn to_vec(&self) -> Vec<u8> {
         match self {
             Message::Ack { block } => {
                 let mut data = Vec::with_capacity(4);
                 data.extend((Operation::Ack as u16).to_be_bytes());
                 data.extend(block.to_be_bytes());
                 data
-            },
+            }
             Message::Data { block, data } => {
                 let mut bytes = Vec::with_capacity(data.len() + 4);
                 bytes.extend((Operation::Data as u16).to_be_bytes());
                 bytes.extend(block.to_be_bytes());
                 bytes.extend(data);
                 bytes
-            },
+            }
             Message::Error { kind, msg } => {
                 let mut bytes = Vec::with_capacity(4 + msg.len());
                 bytes.extend((Operation::Error as u16).to_be_bytes());
@@ -152,8 +200,12 @@ impl Message {
                 bytes.extend(msg.as_bytes());
                 bytes.push(0);
                 bytes
-            },
-            Message::Request { read, filename, mode } => {
+            }
+            Message::Request {
+                read,
+                filename,
+                mode,
+            } => {
                 // Make sure the bytes have enough capacity for any message size
                 let mut bytes = Vec::with_capacity(512);
                 if *read {
@@ -161,7 +213,12 @@ impl Message {
                 } else {
                     bytes.extend((Operation::Wrq as u16).to_be_bytes());
                 }
-                bytes.extend(filename.to_str().expect("Path is invalid UTF8 string").as_bytes());
+                bytes.extend(
+                    filename
+                        .to_str()
+                        .expect("Path is invalid UTF8 string")
+                        .as_bytes(),
+                );
                 bytes.push(0);
                 bytes.extend(mode.to_str());
                 bytes
@@ -169,6 +226,9 @@ impl Message {
         }
     }
 
+    /// Parses the Ack message type
+    ///
+    /// See [`Message::try_from_bytes`] for interpreting the return value.
     fn parse_ack(data: &[u8]) -> Result<Self, Self> {
         // We know from [`try_from_bytes`] that data must be at least two
         // so we can just pull a u16 from data and return it
@@ -176,6 +236,9 @@ impl Message {
         Ok(Self::Ack { block })
     }
 
+    /// Parses the Data message type
+    ///
+    /// See [`Message::try_from_bytes`] for interpreting the return value.
     fn parse_data(data: &[u8]) -> Result<Self, Self> {
         if data.len() < 3 {
             return Err(Self::Error {
@@ -190,7 +253,9 @@ impl Message {
             data: file_data,
         })
     }
-
+    /// Parses the Error message type
+    ///
+    /// See [`Message::try_from_bytes`] for interpreting the return value.
     fn parse_error(data: &[u8]) -> Result<Self, Self> {
         if data.len() < 4 {
             return Err(Self::Error {
@@ -201,17 +266,26 @@ impl Message {
         let kind = u16::from_be_bytes(data[..2].try_into().unwrap());
         let kind = Error::try_from(kind)?;
         let msg = CStr::from_bytes_until_nul(&data[2..])?.to_str()?;
-        Ok(Self::Error { kind, msg: msg.into() })
+        Ok(Self::Error {
+            kind,
+            msg: msg.into(),
+        })
     }
-
+    /// Parses the Read and Write Request message type
+    ///
+    /// See [`Message::try_from_bytes`] for interpreting the return value.
     fn parse_req(read: bool, data: &[u8]) -> Result<Self, Self> {
         let path = CStr::from_bytes_until_nul(data)?;
         let path_size = path.to_bytes().len();
         let path = PathBuf::from(path.to_str()?);
-        let mode = &data[path_size+1..];
+        let mode = &data[path_size + 1..];
         let mode_str = CStr::from_bytes_until_nul(mode)?;
         let mode = Mode::try_from(mode_str.to_str()?)?;
-        Ok(Message::Request { read, filename: path, mode })
+        Ok(Message::Request {
+            read,
+            filename: path,
+            mode,
+        })
     }
 }
 
@@ -255,8 +329,8 @@ mod test {
             Message::Data { block, data } => {
                 assert_eq!(block, 9);
                 assert_eq!(data.len(), 9);
-                assert_eq!(data, [1,2,3,4,5,6,7,8,9]);
-            },
+                assert_eq!(data, [1, 2, 3, 4, 5, 6, 7, 8, 9]);
+            }
             _ => assert!(false),
         }
     }
@@ -271,7 +345,7 @@ mod test {
             Message::Error { kind, msg } => {
                 assert_eq!(Error::AccessViolation, kind);
                 assert_eq!("hello", msg);
-            },
+            }
             _ => assert!(false),
         }
     }
@@ -290,29 +364,43 @@ mod test {
 
     #[test]
     fn test_req_parsing() {
-        let read_req = &[0, 1, b'/', b'a', b'b', b'c', b'/', b'd', b'e', b'f', 0, b'o', b'c', b't', b'e', b't', 0];
+        let read_req = &[
+            0, 1, b'/', b'a', b'b', b'c', b'/', b'd', b'e', b'f', 0, b'o', b'c', b't', b'e', b't',
+            0,
+        ];
         let read = Message::try_from_bytes(read_req);
         assert!(read.is_ok());
         let read = read.unwrap();
         match read {
-            Message::Request { read, filename, mode } => {
+            Message::Request {
+                read,
+                filename,
+                mode,
+            } => {
                 assert!(read);
                 assert_eq!(filename, PathBuf::from("/abc/def"));
                 assert_eq!(Mode::Octet, mode);
-            },
+            }
             _ => assert!(false),
         }
 
-        let write_req = &[0, 2, b'.', b'/', b'q', b'e', b'd', b'/', b'b', b'f', b'g', 0, b'm', b'a', b'i', b'l', 0];
+        let write_req = &[
+            0, 2, b'.', b'/', b'q', b'e', b'd', b'/', b'b', b'f', b'g', 0, b'm', b'a', b'i', b'l',
+            0,
+        ];
         let write = Message::try_from_bytes(write_req);
         assert!(write.is_ok());
         let write = write.unwrap();
         match write {
-            Message::Request { read, filename, mode } => {
+            Message::Request {
+                read,
+                filename,
+                mode,
+            } => {
                 assert!(!read);
                 assert_eq!(filename, PathBuf::from("./qed/bfg"));
                 assert_eq!(Mode::Mail, mode);
-            },
+            }
             _ => assert!(false),
         }
     }

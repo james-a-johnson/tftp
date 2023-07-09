@@ -1,5 +1,8 @@
+//! Definition of the error type used within the TFTP library
+
 use thiserror::Error;
 
+/// Errors defined by the TFTP rfc
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
 #[repr(u16)]
 pub enum Error {
