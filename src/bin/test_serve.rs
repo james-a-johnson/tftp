@@ -1,6 +1,8 @@
-use tftp::ServerBuilder;
-use std::path::PathBuf;
+//! Simple binary for starting a tftp server serving files from the current directory
+
 use std::net::{IpAddr, Ipv4Addr};
+use std::path::PathBuf;
+use tftp::ServerBuilder;
 
 fn main() -> Result<(), Box<(dyn std::error::Error + 'static)>> {
     let server = ServerBuilder::new()
